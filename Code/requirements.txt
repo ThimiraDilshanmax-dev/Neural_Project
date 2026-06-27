@@ -1,0 +1,13 @@
+# Core (always required) -- pre-installed on Kaggle
+numpy>=1.24
+pandas>=2.0
+pillow>=9.5
+scipy>=1.10
+matplotlib>=3.7
+
+# Classical baseline
+scikit-image>=0.21
+scikit-learn>=1.3
+
+# CNN (transfer learning). On Kaggle, tensorflow is already available.
+tensorflow>=2.13
