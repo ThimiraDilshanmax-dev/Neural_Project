@@ -134,6 +134,32 @@ def score_mask(pred: np.ndarray, gt: np.ndarray) -> LocalisationScore:
     return LocalisationScore(float(iou), float(precision), float(recall), float(f1))
 
 
+def region_metrics(pred: np.ndarray, gt: np.ndarray) -> dict:
+    """Defect-level (region) detection metrics.
+
+    Pixel IoU is punishing for hairline defects: a correct detection that is a
+    few pixels off scores near zero.  Industrially, what matters is whether each
+    *defect* is found.  Here a ground-truth connected component counts as
+    **detected** if the predicted mask touches it, and a predicted component is
+    a **false alarm** if it touches no ground-truth defect.
+    """
+    from scipy.ndimage import label
+
+    gt_lbl, n_gt = label(gt.astype(bool))
+    pr_lbl, n_pr = label(pred.astype(bool))
+    detected = sum(1 for i in range(1, n_gt + 1)
+                   if pred.astype(bool)[gt_lbl == i].any())
+    true_alarms = sum(1 for j in range(1, n_pr + 1)
+                      if gt.astype(bool)[pr_lbl == j].any())
+    recall = detected / n_gt if n_gt else 1.0
+    precision = true_alarms / n_pr if n_pr else 0.0
+    f1 = (2 * precision * recall / (precision + recall)
+          if (precision + recall) else 0.0)
+    return {"region_recall": float(recall), "region_precision": float(precision),
+            "region_f1": float(f1), "n_gt_defects": int(n_gt),
+            "n_pred_regions": int(n_pr)}
+
+
 def find_mask_pairs(image_dir: Path, mask_dir: Optional[Path] = None
                     ) -> List[Tuple[Path, Path]]:
     """Match AITEX defective images with their ``*_mask.png`` ground truth."""

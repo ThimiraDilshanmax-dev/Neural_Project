@@ -53,6 +53,56 @@ def glcm_features(
     return np.asarray(feats, dtype=np.float32)
 
 
+def gabor_features(gray: np.ndarray) -> np.ndarray:
+    """Multi-scale, multi-orientation Gabor-filter energy statistics.
+
+    Woven fabric has a strong oriented, periodic structure; Gabor filters are the
+    classic textile-inspection descriptor for it, capturing frequency/orientation
+    information that LBP and GLCM miss. Computed on a 64x64 resize for speed
+    (energy statistics are scale-robust).
+    """
+    from skimage.filters import gabor
+    from skimage.transform import resize
+
+    g = resize(gray, (64, 64), preserve_range=True,
+               anti_aliasing=True).astype(np.float32) / 255.0
+    feats = []
+    for freq in (0.15, 0.3):
+        for theta in (0.0, np.pi / 4, np.pi / 2, 3 * np.pi / 4):
+            real, imag = gabor(g, frequency=freq, theta=theta)
+            mag = np.sqrt(real * real + imag * imag)
+            feats += [float(mag.mean()), float(mag.std())]
+    return np.asarray(feats, dtype=np.float32)
+
+
+def fourier_features(gray: np.ndarray) -> np.ndarray:
+    """Frequency-domain (periodicity) statistics from the 2-D FFT.
+
+    A defect-free weave is highly periodic -> sharp spectral peaks; a defect
+    disrupts that periodicity, redistributing spectral energy. Captures the
+    low/mid/high radial energy split, spectral entropy and peak strength.
+    """
+    g = gray.astype(np.float32) / 255.0
+    g = g - g.mean()
+    F = np.fft.fftshift(np.abs(np.fft.fft2(g)))
+    F2 = F * F
+    total = float(F2.sum()) + 1e-9
+    h, w = F.shape
+    yy, xx = np.ogrid[:h, :w]
+    rad = np.sqrt((yy - h // 2) ** 2 + (xx - w // 2) ** 2)
+    low, mid, high = rad <= 8, (rad > 8) & (rad <= 32), rad > 32
+    p = (F2.ravel() / total)
+    p = p[p > 0]
+    spec_entropy = float(-(p * np.log2(p)).sum())
+    fr = F.copy()
+    fr[low] = 0
+    peak_ratio = float(fr.max() / (fr.mean() + 1e-9))
+    return np.asarray([
+        F2[low].sum() / total, F2[mid].sum() / total, F2[high].sum() / total,
+        spec_entropy / 20.0, peak_ratio / 1000.0,
+    ], dtype=np.float32)
+
+
 def intensity_edge_features(gray: np.ndarray) -> np.ndarray:
     from scipy.stats import skew, kurtosis
     from skimage.filters import sobel
@@ -96,12 +146,18 @@ def image_feature_vector(gray: np.ndarray, cfg: Config) -> np.ndarray:
     more informative than the average over the whole (mostly clean) image.
     """
     patches = extract_patches(gray, cfg.patch_size, cfg.patch_stride)
+    # Skip blank white-padding patches (AITEX strips have ~1000px of uniform
+    # border): including them dilutes the aggregation and measurably hurts
+    # accuracy. Fall back to all patches only if every patch is blank.
+    kept = [p for p in patches if float(p.array.std()) >= 5.0] or patches
     per_patch = []
-    for p in patches:
+    for p in kept:
         vec = np.concatenate([
             lbp_histogram(p.array, cfg.lbp_points, cfg.lbp_radius),
             glcm_features(p.array, cfg.glcm_distances, cfg.glcm_angles),
             intensity_edge_features(p.array),
+            gabor_features(p.array),
+            fourier_features(p.array),
         ])
         per_patch.append(vec)
     per_patch = np.stack(per_patch, axis=0)

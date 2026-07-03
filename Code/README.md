@@ -43,7 +43,8 @@ Code/
 ├── run_classical.py        # train + evaluate the classical baseline
 ├── run_cnn.py              # train + evaluate the CNN
 ├── run_predict.py          # fit final model -> outputs/submission.csv
-├── run_localisation.py     # extended task: defect localisation + IoU
+├── run_extended.py         # extended task: train AE + U-Net, compare IoU
+├── run_localisation.py     # classical/CNN heatmap localisation (baseline)
 ├── notebooks/
 │   └── fabric_defect_detection_kaggle.ipynb   # self-contained Kaggle notebook
 ├── outputs/                # models, figures, submission.csv (gitignored)
@@ -54,6 +55,8 @@ Code/
     ├── features.py         # LBP + GLCM + edge/intensity descriptors
     ├── classical.py        # features -> StandardScaler -> SVM / RandomForest
     ├── cnn.py              # MobileNetV2 transfer learning (patch / full image)
+    ├── autoencoder.py      # Task 3: conv autoencoder, reconstruction-error anomaly
+    ├── unet.py             # Task 4: U-Net segmentation (BCE+Dice) on masks
     ├── evaluate.py         # accuracy, confusion matrix, precision/recall/F1
     ├── predict.py          # submission writer (preserves sample IDs/order)
     └── localisation.py     # heatmaps -> masks -> boxes, IoU scoring
@@ -72,21 +75,39 @@ The vector feeds a StandardScaler + SVM-RBF (or RandomForest), `class_weight="ba
 ### CNN (`src/cnn.py`)
 Transfer learning from an ImageNet **MobileNetV2** backbone with on-the-fly data
 augmentation. Two strategies for the very wide images:
-* **patch** *(default)* — 16 patches/strip at native resolution; image score =
-  **max** patch probability, with the decision threshold calibrated on validation.
+* **patch** *(default)* — trained on **overlapping** patches (stride 128 → 31
+  patches/strip, ~2× data); at inference each patch is scored with **test-time
+  augmentation** (average over 4 flip variants) and the image score is the
+  **max** patch probability, threshold calibrated on validation.
 * **full** — resize the whole strip to a square input.
 
 Training is two-phase: frozen-backbone head training, then fine-tuning the top
-layers at a low learning rate. Class imbalance is handled with class weights.
+60 backbone layers at a low learning rate. Class imbalance is handled with class
+weights. `run_predict.py --model ensemble` additionally blends the CNN score
+with the SVM probability (weight + threshold grid-searched on validation).
 
-### Localisation — extended task (`src/localisation.py`)
-* `residual_heatmap` — classical: a defect breaks the periodic weave, so
-  `|image − median-smoothed image|` highlights it (no training needed).
-* `cnn_heatmap` — slide the trained patch CNN to paint a weakly-supervised
-  probability map.
+### Extended task — localisation with deep networks
+Two deep models localise defects on AITEX and are compared by pixel-level IoU/F1
+on the same held-out defective images (`run_extended.py`):
 
-Heatmaps are thresholded + morphologically cleaned into masks and bounding boxes,
-then scored against AITEX `*_mask.png` ground truth with **IoU / precision / recall / F1**.
+* **Task 3 — Autoencoder** (`src/autoencoder.py`): a convolutional autoencoder
+  trained on **defect-free patches only**. The anomaly map is **1 − SSIM(input,
+  reconstruction)** — structural similarity localises broken weave far better
+  than raw `|input − reconstruction|` (no defective labels at training time).
+* **Task 4 — U-Net** (`src/unet.py`): supervised segmentation with an
+  **ImageNet-pretrained MobileNetV2 encoder**, a recall-weighted
+  **Focal-Tversky + BCE** loss, defect-bearing patches oversampled and
+  **flip-augmented ×4**, and the binarisation threshold **calibrated on the
+  training pairs**. At inference the strip is tiled, each tile segmented, and
+  predictions stitched back to full resolution.
+
+Both are scored with pixel IoU/precision/recall/F1 **and** region-level
+detection metrics (a ground-truth defect counts as found if the prediction
+touches it) — pixel IoU alone is punishingly strict for hairline defects.
+
+A simpler classical/CNN heatmap localiser (`src/localisation.py`,
+`run_localisation.py`) is retained as a non-learned baseline: `residual_heatmap`
+(`|image − median-smoothed|`) and `cnn_heatmap` (sliding the patch classifier).
 
 ## Running locally
 
@@ -98,16 +119,21 @@ python run_classical.py --classifier svm --cv
 python run_cnn.py --mode patch
 python run_predict.py --model cnn --mode patch      # writes outputs/submission.csv
 
-# Extended task -- auto-detects archive/Defect_images + archive/Mask_images:
-python run_localisation.py --method residual         # classical, no training
-python run_localisation.py --method cnn --model outputs/cnn_patch.keras
+# Extended task -- trains Task-3 autoencoder + Task-4 U-Net and compares IoU
+# (auto-detects archive/Defect_images, Mask_images, NODefect_images):
+python run_extended.py
+
+# Optional non-learned baseline localiser:
+python run_localisation.py --method residual
 ```
 
-The classical residual method is an unsupervised baseline and is weak across the
-full AITEX defect set (mean IoU ≈ 0.015 over 103 masks; better on large
-high-contrast defects, poor on small/subtle ones). The CNN sliding-window heatmap
-is the stronger localiser. Both write overlay images to `outputs/localisation/`
-and, when masks are present, report mean IoU / precision / recall / F1.
+`run_extended.py` trains the autoencoder on the 141 defect-free images and the
+U-Net on a train split of the defect/mask pairs, then reports IoU/precision/
+recall/F1 for **both** on the same held-out defects and saves side-by-side
+overlays (`input / ground-truth / autoencoder / U-Net`) to `outputs/extended/`.
+The supervised U-Net localises more precisely; the autoencoder needs no defective
+labels. (The classical `run_localisation.py` residual heatmap is a weak
+non-learned reference, mean IoU ≈ 0.015 over 103 masks.)
 
 `src/config.py` auto-detects the dataset: it uses this repository when run locally
 and a `/kaggle/input/...` competition folder on Kaggle. Override with the

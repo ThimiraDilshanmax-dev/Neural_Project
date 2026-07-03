@@ -12,10 +12,22 @@
 ---
 
 ## Abstract
-_[3–5 sentences. State the problem (automating AITEX fabric inspection), what you
-built (a classical LBP/GLCM+SVM baseline vs a MobileNetV2 transfer-learning CNN),
-the headline validation accuracy of each, which won, and the localisation result.
-Fill once the numbers below are final.]_
+We automate defect inspection on the AITEX fabric database across four models,
+evaluated by **3-fold out-of-fold cross-validation over all 173 images** for
+trustworthy estimates. For binary classification, an **engineered classical model
+reaches 0.861 OOF accuracy** (0.839 ± 0.014 across six fold seeds) — combining
+LBP + GLCM + edge + **Gabor + Fourier** features, **blank-border-patch removal**,
+and an **SVM/RF/GB voting ensemble**, each verified to raise accuracy. Under this
+honest protocol it clearly beats the 3-fold-bagged MobileNetV2 patch CNN (0.688),
+which nonetheless offers the best **defective recall (0.878)**, the industrially
+critical metric. (A second backbone, EfficientNetB0, was *removed* after OOF
+measurement showed it hurt — measurement-driven iteration.) For the extended
+localisation task, a supervised U-Net with a pretrained encoder and Focal-Tversky
+loss was engineered from **pixel IoU 0.016 up to 0.254**, finding **62% of defects
+at 60% precision (region F1 0.610)**, decisively beating the unsupervised SSIM
+autoencoder. The headline lesson: on small datasets, **understanding the data and
+using domain-appropriate features beat added model capacity** — and disciplined
+OOF measurement is what separates real gains from noise.
 
 ## 1. Introduction
 Quality control in textile manufacturing relies heavily on manual visual
@@ -24,9 +36,15 @@ project automates the task on the **AITEX Fabric Image Database**: classifying
 4096×256 grayscale fabric strips as **defective** (1) or **defect-free** (0), and
 — as an extended task — **localising** the defect region at the pixel level.
 
-We develop and compare two approaches under an identical validation protocol:
-1. a **classical image-processing baseline** (hand-crafted texture features + SVM);
-2. a **convolutional neural network** using transfer learning.
+The project has four parts:
+1. **Classical baseline** — hand-crafted texture features (LBP, GLCM, edges) + SVM
+   for defective/defect-free classification (Kaggle task).
+2. **CNN classifier** — transfer learning, compared against the classical baseline
+   under an identical validation protocol (Kaggle task).
+3. **Autoencoder** — trained on defect-free images only; reconstruction error as an
+   unsupervised anomaly score (extended task).
+4. **U-Net** — supervised segmentation trained on the binary masks to localise
+   defects, evaluated by IoU and compared against the autoencoder (extended task).
 
 Because the dataset is small (173 labelled images) and the images are extremely
 wide, we investigate **data augmentation**, **transfer learning** and
@@ -67,106 +85,224 @@ and inverse-frequency class weights (CNN).
 ## 4. Methodology
 
 ### 4.1 Validation protocol
-A single **seeded (42) stratified 75/25 split** of the 173 training images is
-reused by *both* models, so the comparison is fair and reproducible. All metrics
-below are on this held-out validation set; the test-set labels are hidden and
-scored by Kaggle.
+**Stratified 3-fold cross-validation with out-of-fold (OOF) evaluation** (seed
+42): every image is predicted exactly once by models that never saw it, so all
+classification metrics are computed on **all 173 images** rather than a noisy
+43-image hold-out (where each image is worth ±2.3 accuracy points). The classical
+model and the CNNs use the *same folds*, so the comparison is fair. At test time
+the CNN prediction averages **all fold models** (bagging), so the deployed
+committee has collectively learned from every labelled image. The test-set labels
+are hidden and scored by Kaggle.
 
 ### 4.2 Classical baseline
-Each 4096×256 strip is tiled into sixteen 256×256 patches. Per patch we extract:
+Each 4096×256 strip is tiled into 256×256 patches. **Blank white-padding patches
+(std < 5) are skipped** — AITEX strips carry ~1000px of uniform border that
+otherwise dilutes the aggregation. Per remaining patch we extract four
+complementary descriptor families:
 - **LBP** — uniform Local Binary Pattern histogram (P=24, R=3): micro-texture.
 - **GLCM** — gray-level co-occurrence Haralick properties (contrast,
   dissimilarity, homogeneity, energy, correlation, ASM) over distances {1,3,5}
   and 4 angles, on 32 quantised levels.
 - **First-order + edge** — mean, std, skew, kurtosis, intensity entropy, and
   Sobel edge mean/std/density.
+- **Gabor + Fourier** — Gabor filter energy (8 filters: 2 frequencies × 4
+  orientations) and FFT periodicity statistics (radial low/mid/high energy split,
+  spectral entropy, peak strength). Fabric is oriented and periodic; a defect
+  disrupts that spectrum in ways LBP/GLCM do not capture.
 
-Patch features are aggregated across the strip by **mean and max**. The *max* is
-key: a defect occupies only a small slice of a 4096-px-wide image, so the single
-most-anomalous patch carries the signal. The resulting **80-dimensional** vector
-feeds a `StandardScaler` + **SVM (RBF, C=10, balanced)** pipeline. (A
-RandomForest variant is also available via `--classifier rf`.)
+Patch features are aggregated across the kept patches by **mean and max** (the
+*max* captures the single most-anomalous patch). The resulting **122-dimensional**
+vector feeds a `StandardScaler` + **soft-voting ensemble of SVM (RBF) +
+RandomForest + GradientBoosting**. Every one of these choices (blank-skip,
+Gabor/Fourier, voting) was **verified to raise 3-fold OOF accuracy** before
+adoption (§5.0); single-classifier variants remain available via `--classifier`.
 
 ### 4.3 CNN (transfer learning)
 - **Backbone:** ImageNet-pretrained **MobileNetV2** (`include_top=False`,
   global-average pooling) + dropout(0.3) + sigmoid head.
 - **Augmentation:** random horizontal/vertical flips, ±5% rotation, ±10% zoom,
   ±10% contrast (applied on-the-fly during training).
-- **Patch-based training** _(primary)_: every strip → 16 patches resized to
-  224×224; patches inherit the image label. At inference the image score is the
-  **max** patch probability and the decision threshold is **calibrated on the
-  validation split**. A **full-image** mode (whole strip resized to 224×224) is
-  provided for comparison (`--mode full`).
+- **Patch-based training** _(primary)_: strips are tiled with an **overlapping
+  stride of 128** (31 patches/strip, ~4,000 training patches) resized to
+  224×224; patches inherit the image label. At inference each patch is scored
+  with **test-time augmentation** (average over its 4 flip variants), the image
+  score is the **max** patch probability, and the decision threshold is
+  **calibrated on the validation split**. A **full-image** mode is provided for
+  comparison (`--mode full`).
 - **Two-phase schedule:** (1) train the head with the backbone frozen
-  (lr=1e-3, ≤12 epochs); (2) unfreeze the top 30 backbone layers and fine-tune
-  (lr=1e-5, ≤8 epochs). Early stopping on training loss.
+  (lr=1e-3, ≤12 epochs); (2) unfreeze the top 60 backbone layers and fine-tune
+  (lr=1e-5, ≤10 epochs). Early stopping on training loss.
+- **SVM+CNN ensemble:** the CNN score and SVM probability are blended
+  (weight and threshold grid-searched on validation); the final predictor is
+  whichever wins on the validation split.
 
 ### 4.4 Localisation (extended task)
-Two heatmap methods produce a per-pixel defect map, thresholded + morphologically
-cleaned into a binary mask and bounding boxes:
-- **Classical residual** — `|image − median-smoothed image|`; a defect breaks the
-  periodic weave and stands out. Thresholded at the 99.5th percentile.
-  *Unsupervised, no training.*
-- **CNN sliding window** — slide the trained patch classifier with a 128-px
-  stride and paint each region with its defect probability. *Weakly supervised.*
+Two **deep** models localise defects on the original AITEX archive and are
+compared on the same held-out defective images.
 
-Predicted masks are scored against AITEX `*_mask.png` ground truth with
-**pixel-level IoU, precision, recall and F1**.
+**Task 3 — Convolutional autoencoder (unsupervised).** A symmetric conv
+encoder–decoder (32→64→128 filters, 8× spatial bottleneck) is trained with MSE
+on 256×256 patches drawn from the **141 defect-free images only**. Having learned
+to reconstruct the normal weave, it reconstructs defects poorly. The anomaly map
+is **1 − SSIM(input, reconstruction)**: structural similarity compares local
+texture windows rather than raw intensities, so it localises broken-weave
+structure far better than plain `|input − reconstruction|`. The map is smoothed,
+normalised and thresholded at the 99th percentile.
+
+**Task 4 — U-Net (supervised).** A U-Net whose **encoder is an
+ImageNet-pretrained MobileNetV2** (skip connections from five encoder stages) is
+trained on (image-patch → mask-patch) pairs, using the binary masks as ground
+truth and a recall-weighted **Focal-Tversky + BCE** loss (β=0.7 penalises the
+false negatives that plain BCE/Dice produce on tiny defects). Defect-bearing
+patches are oversampled (≈1:1) and all tiles are **flip-augmented ×4**. At
+inference the strip is tiled into 256×256 patches, segmented, and stitched back
+to full 4096×256 resolution; the binarisation threshold is **calibrated on the
+training pairs** (not fixed at 0.5), and no minimum-area filtering is applied so
+hairline defects survive.
+
+**Protocol.** The defect/mask pairs are split 80/20 (seeded). The U-Net trains on
+the 80% train split; **both** models are evaluated on the held-out 20% so the
+comparison is fair. Masks are scored with pixel-level **IoU, precision, recall and
+F1** and with **region-level detection metrics** (a ground-truth defect counts as
+found if the predicted mask touches it; a predicted region touching no defect is a
+false alarm). The region metric matters because pixel IoU is punishingly strict
+for hairline defects — industrially, the question is whether each defect is
+*found*, not whether its outline is pixel-perfect. A non-learned classical
+residual heatmap is reported as a weak reference baseline.
 
 ## 5. Results
 
-### 5.1 Classification — validation set
-| Model | Accuracy | Macro-F1 | Precision (defective) | Recall (defective) |
-|-------|----------|----------|------------------------|---------------------|
-| Classical (SVM, LBP+GLCM+edge) — hold-out | 0.698 | 0.672 | 0.692 | 0.500 |
-| Classical (SVM) — **5-fold CV (all data)** | **0.832 ± 0.049** | **0.827 ± 0.051** | — | — |
-| CNN (patch, MobileNetV2) | _[ ]_ | _[ ]_ | _[ ]_ | _[ ]_ |
-| CNN (full-image) | _[ ]_ | _[ ]_ | _[ ]_ | _[ ]_ |
+> The tables below report **out-of-fold (3-fold) results over all 173 images** —
+> the most reliable estimate available. An earlier single-split run gave higher
+> but noisier CNN numbers (≈0.81 on 43 images); the honest OOF figure is lower.
 
-> Classical numbers above are **real runs** (`run_classical.py --classifier svm --cv`).
-> The single 43-image hold-out is noisy; the 5-fold CV is the reliable estimate.
-> CNN numbers: fill from `run_cnn.py --mode patch` / `--mode full` (or the notebook on Kaggle).
+### 5.0 What worked and what didn't (ablation notes)
+Every change was measured by 3-fold OOF accuracy (fixed 0.5 threshold, so
+unbiased), not assumed. The classical model improved the most, in three verified
+steps — each stable across six different fold seeds:
 
-**Confusion matrices** (saved to `outputs/`):
-- Classical: `outputs/confusion_classical_svm.png`
-- CNN: `outputs/confusion_cnn_patch.png`
+| Change to the classical model | OOF accuracy |
+|---|---|
+| Baseline (LBP+GLCM+edge, all patches, SVM) | 0.751 |
+| **+ skip blank white-padding patches** | 0.804 (+0.052) |
+| **+ Gabor + Fourier features** | 0.827 |
+| **+ SVM/RF/GB voting ensemble** | **0.856** (+0.104 total) |
 
-_[Embed both figures here.]_
+Averaged over six fold seeds the final recipe scores **0.839 ± 0.014** vs the
+baseline's **0.774 ± 0.017** — a robust +6.5 points with *lower* variance.
 
-### 5.2 Per-class analysis
-On the hold-out split the classical SVM achieves balanced precision (0.70
-defect-free, 0.69 defective) but **asymmetric recall: 0.84 defect-free vs 0.50
-defective** — i.e. it misses half the defective strips (9 of 18 defective images
-fell into the `pred_free` column of the confusion matrix). For quality control
-this **false-negative** behaviour is the costly one: a missed defect ships a
-faulty roll. _[Compare against the CNN's per-class recall once available — the
-patch + max-aggregation CNN is expected to improve defective recall, since it
-only needs one suspicious patch to flag a strip.]_
+- **Biggest single win:** discovering that AITEX strips carry ~1000px of blank
+  white border, so 4 of 16 patches were pure padding — skipping them added ~5
+  points and was essentially free. (Applied to the CNN too, where padding patches
+  were being *mislabelled* as defective.)
+- **Localisation overhaul helped hugely:** pretrained U-Net encoder +
+  Focal-Tversky + augmentation + defect-free tiles took IoU **0.016 → 0.254** and
+  region-F1 to **0.610**.
+- **Classifier tuning:** adding **ExtraTrees** to the vote and lightly tuning the
+  members added ~1.2 accuracy points on *unseen* fold seeds (validated on seeds not
+  used to pick the config), taking seed-42 OOF to ~0.879.
+- **Hurt / reverted:** **EfficientNetB0** as a second CNN backbone stalled near
+  chance and dragged the CNN down; removed after OOF caught it. Feature selection
+  and SVM-only tuning did *not* help and were not adopted.
+- **Sobering:** an early single 43-image split scored the CNN at 0.814; the honest
+  OOF estimate is 0.688. Small hold-outs flatter models — hence the OOF protocol.
 
-### 5.3 Classical vs CNN
-_[2–4 sentences. Which won on accuracy / macro-F1? Did transfer learning +
-patches beat hand-crafted features, and by how much? Was the gain worth the extra
-compute given only 173 images? Reference the comparison bar chart from the
-notebook.]_
+**Error analysis — where the ceiling is.** Of the images misclassified in ≥5 of 6
+fold seeds, **13 of 14 are defective strips predicted as clean** — the errors are
+almost entirely *missed subtle defects*, not false alarms on good fabric. A handful
+of AITEX defects are simply too faint to separate from normal weave using texture
+features; this is the genuine ceiling for the classical approach, and exactly where
+the CNN's high defect recall (0.878) is complementary.
 
-### 5.4 Localisation (extended task)
-| Method | Mean IoU | Mean F1 | Mean Precision | Mean Recall | #images |
-|--------|----------|---------|----------------|-------------|---------|
-| Classical residual (pct 99.5) | 0.015 | 0.026 | 0.026 | 0.070 | 103 |
-| CNN sliding window | _[ ]_ | _[ ]_ | _[ ]_ | _[ ]_ | 103 |
+### 5.1 Classification — out-of-fold (all 173 images, final run)
+| Model (3-fold OOF, 173 images) | Accuracy | Macro-F1 | Recall (defective) |
+|-------|----------|----------|---------------------|
+| Classical — *original* (LBP+GLCM+edge, SVM) | 0.751 | 0.745 | 0.689 |
+| Classical — final (＋Gabor/Fourier, blank-skip, voting) | 0.861 | 0.856 | 0.784 |
+| **Ensemble / final predictor (calibrated)** | **0.867** | **0.862** | 0.784 |
+| CNN (3-fold bagged MobileNetV2) | 0.688 | 0.687 | **0.878** |
 
-> Classical row is a **real run** (`run_localisation.py --method residual`, full
-> 103 AITEX pairs). CNN row: fill after `--method cnn --model outputs/cnn_patch.keras`.
-> Example overlays in `outputs/localisation/`. _[Embed 2–3 overlay images.]_
+> The upgraded **classical voting model is the strongest classifier at 0.861 OOF**
+> — a +11-point gain over the original classical baseline and far above the CNN.
+> *(The voting ensemble was subsequently improved with ExtraTrees + light tuning;
+> local seed-42 OOF is ~0.879 and it wins on unseen seeds — re-run the notebook to
+> refresh this row to that value.)*
+> The final predictor (0.867) is that model with an OOF-calibrated threshold; the
+> blend grid-search kept weight 0 on the CNN. The improvement came entirely from
+> feature/data engineering verified on all 173 images (§5.0), not from more deep
+> learning. The CNN's distinctive value remains its **defective recall (0.878)**,
+> the safety-critical metric, and the shared backbone that powers the U-Net.
+>
+> **Full per-class (OOF):**
+> - Classical vote — defect_free: P=0.850 R=0.919 F1=0.883 · defective: P=0.879 R=0.784 F1=0.829
+> - Final ensemble — defect_free: P=0.852 R=0.929 F1=0.889 · defective: P=0.892 R=0.784 F1=0.835
+> - CNN (bagged)   — defect_free: P=0.857 R=0.545 F1=0.667 · defective: P=0.591 R=0.878 F1=0.707
+>
+> Confusion matrices (rows=true [free, defect], cols=pred) — Classical vote
+> `[[91,8],[16,58]]`, Final ensemble `[[92,7],[16,58]]`, CNN `[[54,45],[9,65]]`.
 
-The classical residual localiser is **weak across the full defect set** (mean IoU
-0.015). It performs noticeably better on large, high-contrast categories (e.g.
-"broken end" subset ≈ 0.09 IoU) but poorly on small/subtle defects, and a single
-global percentile cannot adapt to AITEX's very different defect sizes across the
-9 categories. This motivates the learned alternatives: the **CNN sliding-window
-heatmap** localises more precisely, and a fully supervised **U-Net trained on the
-masks** would be the natural next step (see Future work). The key limitation
-throughout is that patch labels are only image-level (weak supervision).
+_[Embed the classical (vote, OOF) and CNN confusion-matrix figures here.]_
+
+### 5.2 Per-class analysis — two complementary operating points
+The final models sit at opposite ends of the QC trade-off:
+- The **CNN is a defect-catcher**: recall 0.878 on defective strips (the patch +
+  max-aggregation design flags a strip if *any* window looks suspicious) at the
+  cost of 43 false alarms on clean strips (defect-free recall 0.566).
+- The **SVM/ensemble is balanced**: defective recall 0.689 with far fewer false
+  alarms (defect-free recall 0.859), which is what maximises plain accuracy.
+
+Which is "better" depends on the cost model: in real inspection a missed defect
+(shipping a faulty roll) usually costs more than a false alarm (re-inspection), so
+the CNN's operating point is arguably the more industrially useful one even though
+the leaderboard metric (accuracy) favours the ensemble.
+
+### 5.3 Classical vs CNN — an honest verdict
+Under the rigorous OOF protocol the **engineered classical model (0.861) clearly
+beats the patch-based transfer-learning CNN (0.688) on accuracy** — a decisive
+gap. This is a legitimate and well-known small-data outcome: with only 173 images,
+a compact, domain-specific texture descriptor (LBP + GLCM + edges + Gabor +
+Fourier, 122-D) purpose-built for woven fabric out-generalises even a bagged,
+augmented, transfer-learned CNN. Crucially, the classical gains came from
+**understanding the data** (blank-border patches were poisoning the features) and
+**domain-appropriate features** (fabric periodicity → Gabor/Fourier), not from
+more model capacity. (An early single 43-image split had suggested CNN 0.814 vs
+SVM 0.698 — the opposite conclusion — illustrating how misleading small hold-outs
+are.) The deep model still contributes what classical features cannot: the highest
+defect recall (0.878) and, via the shared backbone, the U-Net localiser in §5.4.
+
+### 5.4 Localisation (extended task) — Task 3 vs Task 4
+Evaluated on the held-out 20% of defective images (~21 strips):
+
+| Method (21 held-out defects) | Pixel IoU | Pixel F1 | Region recall | Region precision | Region F1 |
+|--------|-----------|----------|---------------|------------------|-----------|
+| **U-Net (Task 4, supervised, pretrained encoder)** | **0.254** | **0.341** | **0.619** | **0.603** | **0.610** |
+| Autoencoder (Task 3, SSIM, unsupervised) | 0.003 | 0.006 | 0.048 | 0.008 | 0.014 |
+
+> Final run, notebook §7.3. The **region** metric counts a ground-truth defect as
+> found if the prediction touches it (a predicted blob touching no defect is a
+> false alarm) — the industrially meaningful "did we find the defect" question,
+> far less punishing than pixel IoU on hairline defects.
+
+**The upgraded U-Net is a genuinely useful localiser.** Pixel IoU rose from an
+early **0.016 to 0.254** (≈16×) through the accuracy overhaul: pretrained
+MobileNetV2 encoder, recall-weighted Focal-Tversky loss, overlapping +
+flip-augmented training tiles, extra defect-free tiles in the negative pool, a
+threshold calibrated on training pairs (0.65), and TTA-stitched inference. At the
+**region level it finds 62% of defects at 60% precision (F1 0.610)** — a solid
+result given only ~82 labelled defective strips, and pixel precision 0.42 shows
+that when it fires, it is usually on or around a real defect.
+
+The **SSIM autoencoder** remains far behind (pixel IoU 0.003, region-recall 0.048;
+an earlier run reached region-recall 0.238, so its weak signal is also unstable
+run-to-run). This is an honest answer to the Task-3 question: reconstruction
+error alone, with no defective examples, *occasionally* fires on visible defects
+but is nowhere near a usable localiser on AITEX's subtle, hairline defects. The
+supervised U-Net wins decisively when masks are available.
+
+**Why pixel IoU stays modest even for a good localiser:** defects are a handful of
+pixels in a ~1M-pixel strip, so even near-perfect localisation yields a small
+intersection — which is exactly why the region-level metric is reported alongside
+and is the fairer headline for this task.
 
 ## 6. Discussion
 - **Small-data strategies that helped:** _[transfer learning, augmentation,
@@ -176,14 +312,29 @@ throughout is that patch labels are only image-level (weak supervision).
   strip's clean patches are labelled positive); the max-aggregation rule
   mitigates this. Very wide aspect ratio; subtle low-contrast defects. Tiny test
   set (74 images) → leaderboard variance.
-- **Future work:** _[multiple-instance learning for patches; segmentation
-  network (U-Net) trained on the AITEX masks for supervised localisation;
-  anomaly-detection / autoencoder approaches; per-defect-type analysis.]_
+- **Future work:** _[stronger U-Net backbones (pretrained encoder, attention);
+  multiple-instance learning for the weakly-labelled patch classifier;
+  per-defect-type localisation analysis across the 9 AITEX categories; combining
+  the autoencoder anomaly score with the U-Net for a semi-supervised localiser.]_
 
 ## 7. Conclusion
-_[3–4 sentences: restate what was built, the winning model and its validation
-accuracy, the localisation outcome, and the key takeaway about classical vs deep
-approaches on this small dataset.]_
+We implemented and compared four models on AITEX under a rigorous out-of-fold
+protocol. For classification, an **engineered classical model reached 0.856 OOF
+accuracy** — a +10-point gain over the original classical baseline, achieved
+entirely through data understanding (removing blank-border patches), domain
+features (Gabor/Fourier for fabric periodicity), and a voting ensemble, each
+verified on all 173 images. It clearly out-scores the transfer-learning patch CNN
+(0.688) on accuracy, while the **CNN dominates on defect recall (0.878)** — two
+complementary operating points, with an early lucky single-split (CNN 0.814)
+showing how misleading small hold-outs can be. Measurement also led us to *remove*
+a backbone (EfficientNetB0) that hurt. For localisation, an accuracy-engineered
+supervised **U-Net lifted pixel IoU from 0.016 to 0.254**, finding **62% of
+defects at 60% precision (region F1 0.610)**, decisively beating the unsupervised
+autoencoder. The key takeaways: at this data scale, classical texture features
+with domain knowledge are the strongest *detector*; deep networks are what make
+*localisation* and high-recall screening possible; and disciplined OOF measurement
+— not stacking ever more machinery — is what actually improved (and occasionally
+corrected) the results.
 
 ## 8. Reproducibility
 All randomness is seeded (`Config.seed = 42`): the stratified split, NumPy and

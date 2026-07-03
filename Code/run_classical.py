@@ -18,7 +18,7 @@ from src.features import build_feature_matrix
 
 def main():
     ap = argparse.ArgumentParser(description="Classical fabric-defect baseline")
-    ap.add_argument("--classifier", choices=["svm", "rf"], default="svm")
+    ap.add_argument("--classifier", choices=["vote", "svm", "rf"], default="vote")
     ap.add_argument("--cv", action="store_true", help="also run 5-fold cross-validation")
     args = ap.parse_args()
 

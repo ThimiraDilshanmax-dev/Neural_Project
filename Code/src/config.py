@@ -52,17 +52,27 @@ class Config:
     patch_size: int = 256          # square patches -> 16 patches per image
     patch_stride: int = 256        # non-overlapping by default
 
-    # Full-image CNN input (wide strip resized to a square the backbone accepts)
-    cnn_input_size: int = 224
+    # CNN input size. Patches are 256x256 natively -- feeding them at native
+    # resolution avoids interpolation blur on hairline defects.
+    cnn_input_size: int = 256
 
     # ---- CNN training ----------------------------------------------------
     backbone: str = "MobileNetV2"  # any keras.applications model name
     batch_size: int = 32
     head_epochs: int = 12          # train classifier head with frozen backbone
-    finetune_epochs: int = 8       # then unfreeze top layers
+    finetune_epochs: int = 10      # then unfreeze top layers
     finetune_lr: float = 1e-5
     head_lr: float = 1e-3
     dropout: float = 0.3
+    train_patch_stride: int = 128  # overlapping patches for training (~2x data)
+    inference_stride: int = 128    # overlapping patches at scoring time too
+    unfreeze_layers: int = 60      # backbone layers unfrozen in phase 2
+    tta: bool = True               # test-time augmentation (flip-averaged)
+    label_smoothing: float = 0.05  # softens the noisy patch labels
+    # MobileNetV2 only by default: EfficientNetB0 was a poor transfer-learner on
+    # this data (stalled near chance) and dragged the average down. Diversity
+    # comes from k-fold bagging instead.
+    ensemble_backbones: tuple = ("MobileNetV2",)
 
     # ---- Classical baseline ---------------------------------------------
     lbp_radius: int = 3

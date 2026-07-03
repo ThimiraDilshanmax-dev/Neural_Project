@@ -83,6 +83,14 @@ def load_gray(path: Path) -> np.ndarray:
         return np.asarray(im.convert("L"), dtype=np.uint8)
 
 
+def list_aitex_nodefect(cfg) -> List[Path]:
+    """Every AITEX defect-free image (recursively, across the per-fabric folders)."""
+    root = cfg.aitex_nodefect_dir
+    if not root.exists():
+        return []
+    return sorted(p for p in root.rglob("*.png") if not p.stem.endswith("_mask"))
+
+
 def load_rgb(path: Path, size: int | None = None) -> np.ndarray:
     """Load an image as ``HxWx3`` uint8; optionally resize to ``size x size``."""
     with Image.open(path) as im:

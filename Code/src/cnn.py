@@ -64,6 +64,9 @@ def build_model(cfg: Config, input_size: int):
 
     augment = tf.keras.Sequential([
         layers.RandomFlip("horizontal_and_vertical"),
+        # Weave is horizontally quasi-periodic: wrap-around translation creates
+        # realistic new weave phases (physically-motivated augmentation).
+        layers.RandomTranslation(0.0, 0.15, fill_mode="wrap"),
         layers.RandomRotation(0.05),
         layers.RandomZoom(0.10),
         layers.RandomContrast(0.10),
@@ -82,13 +85,21 @@ def build_model(cfg: Config, input_size: int):
 # ----------------------------------------------------------------------------
 # Building tf.data pipelines
 # ----------------------------------------------------------------------------
-def _records_to_patch_arrays(records: List[ImageRecord], cfg: Config
+def _records_to_patch_arrays(records: List[ImageRecord], cfg: Config,
+                             stride: int | None = None
                              ) -> Tuple[np.ndarray, np.ndarray]:
-    """Materialise every patch of every record as a uint8 tensor + label."""
+    """Materialise every patch of every record as a uint8 tensor + label.
+
+    ``stride`` < patch_size yields overlapping patches — used for *training*
+    only, roughly doubling the sample count on these wide strips.
+    """
+    stride = stride or cfg.patch_stride
     xs, ys = [], []
     for r in records:
         gray = load_gray(r.path)
-        for p in extract_patches(gray, cfg.patch_size, cfg.patch_stride):
+        for p in extract_patches(gray, cfg.patch_size, stride):
+            if float(p.array.std()) < 5.0:   # skip blank white-padding patches
+                continue
             xs.append(prepare_patch_tensor(p.array, cfg.cnn_input_size))
             ys.append(r.label)
     return np.asarray(xs, dtype=np.uint8), np.asarray(ys, dtype=np.float32)
@@ -124,16 +135,29 @@ class CNNModel:
     threshold: float = 0.5
 
     # ---- per-image scoring ---------------------------------------------
+    def _predict_tta(self, batch: np.ndarray) -> np.ndarray:
+        """Flip-averaged (TTA) probabilities for a batch of tensors."""
+        variants = [batch]
+        if self.cfg.tta:
+            variants += [batch[:, :, ::-1], batch[:, ::-1, :], batch[:, ::-1, ::-1]]
+        probs = [self.model.predict(np.ascontiguousarray(v), verbose=0).ravel()
+                 for v in variants]
+        return np.mean(probs, axis=0)
+
     def score_image(self, gray: np.ndarray) -> float:
         if self.mode == "patch":
-            patches = extract_patches(gray, self.cfg.patch_size, self.cfg.patch_stride)
+            # Overlapping inference windows: a defect straddling a tile border
+            # is seen centred by some window instead of split in half. Blank
+            # white-padding patches are skipped (never contain a defect).
+            patches = extract_patches(gray, self.cfg.patch_size,
+                                      self.cfg.inference_stride)
+            kept = [p for p in patches if float(p.array.std()) >= 5.0] or patches
             batch = np.stack([prepare_patch_tensor(p.array, self.cfg.cnn_input_size)
-                              for p in patches]).astype("float32")
-            probs = self.model.predict(batch, verbose=0).ravel()
-            return float(probs.max())          # max-aggregation
+                              for p in kept]).astype("float32")
+            return float(self._predict_tta(batch).max())   # max-aggregation
         else:
             x = to_rgb(resize_square(gray, self.cfg.cnn_input_size))[None].astype("float32")
-            return float(self.model.predict(x, verbose=0).ravel()[0])
+            return float(self._predict_tta(x)[0])
 
     def predict_image(self, gray: np.ndarray) -> int:
         return int(self.score_image(gray) >= self.threshold)
@@ -168,16 +192,23 @@ def train(
     materialise = _records_to_patch_arrays if mode == "patch" else _records_to_full_arrays
 
     print(f"[cnn:{mode}] preparing training tensors...")
-    x_tr, y_tr = materialise(train_records, cfg)
+    if mode == "patch":
+        x_tr, y_tr = _records_to_patch_arrays(train_records, cfg,
+                                              stride=cfg.train_patch_stride)
+    else:
+        x_tr, y_tr = materialise(train_records, cfg)
     print(f"[cnn:{mode}] {x_tr.shape[0]} training samples of shape {x_tr.shape[1:]}")
     train_ds = _make_dataset(x_tr, y_tr, cfg.batch_size, shuffle=True)
     cw = _class_weights(y_tr)
 
     model, base = build_model(cfg, cfg.cnn_input_size)
+    # Label smoothing softens the noisy patch labels (clean patches from a
+    # defective strip inherit the positive label).
+    loss = tf.keras.losses.BinaryCrossentropy(label_smoothing=cfg.label_smoothing)
 
     # Phase 1: frozen backbone, train the head.
     model.compile(optimizer=tf.keras.optimizers.Adam(cfg.head_lr),
-                  loss="binary_crossentropy", metrics=["accuracy"])
+                  loss=loss, metrics=["accuracy"])
     es = tf.keras.callbacks.EarlyStopping(
         monitor="loss", patience=4, restore_best_weights=True)
     model.fit(train_ds, epochs=cfg.head_epochs, class_weight=cw,
@@ -185,10 +216,10 @@ def train(
 
     # Phase 2: unfreeze the top of the backbone and fine-tune slowly.
     base.trainable = True
-    for layer in base.layers[:-30]:
+    for layer in base.layers[:-cfg.unfreeze_layers]:
         layer.trainable = False
     model.compile(optimizer=tf.keras.optimizers.Adam(cfg.finetune_lr),
-                  loss="binary_crossentropy", metrics=["accuracy"])
+                  loss=loss, metrics=["accuracy"])
     model.fit(train_ds, epochs=cfg.finetune_epochs, class_weight=cw,
               callbacks=[es], verbose=2)
 
@@ -201,3 +232,52 @@ def train(
     result = evaluate(val_true, (val_scores >= cnn.threshold).astype(int))
     print(f"[cnn:{mode}] calibrated threshold = {cnn.threshold:.3f}")
     return cnn, result
+
+
+# ----------------------------------------------------------------------------
+# Multi-backbone ensemble
+# ----------------------------------------------------------------------------
+@dataclass
+class AveragedCNN:
+    """Average of several trained CNNs (different backbones = diverse errors)."""
+    members: list
+    cfg: Config
+    threshold: float = 0.5
+
+    def score_image(self, gray: np.ndarray) -> float:
+        return float(np.mean([m.score_image(gray) for m in self.members]))
+
+    def predict_image(self, gray: np.ndarray) -> int:
+        return int(self.score_image(gray) >= self.threshold)
+
+    def predict_path(self, path: Path) -> int:
+        return self.predict_image(load_gray(path))
+
+
+def train_backbone_ensemble(train_records, val_records, cfg: Config,
+                            backbones=None, mode: str = "patch"):
+    """Train one CNN per backbone and average their per-image scores.
+
+    Different architectures make different mistakes; averaging them is the
+    strongest remaining small-data lever after TTA.  The averaged score gets its
+    own calibrated threshold on the validation split.
+    """
+    from dataclasses import replace
+
+    backbones = backbones or cfg.ensemble_backbones
+    members = []
+    for b in backbones:
+        print(f"\n[cnn-ensemble] === training backbone: {b} ===")
+        member_cfg = replace(cfg, backbone=b)
+        member, res = train(train_records, val_records, member_cfg, mode=mode)
+        print(f"[cnn-ensemble] {b} alone: acc={res.accuracy:.4f}")
+        members.append(member)
+
+    ens = AveragedCNN(members=members, cfg=cfg)
+    val_true = np.array([r.label for r in val_records])
+    val_scores = np.array([ens.score_image(load_gray(r.path)) for r in val_records])
+    ens.threshold = best_threshold(val_true, val_scores)
+    result = evaluate(val_true, (val_scores >= ens.threshold).astype(int))
+    print(f"[cnn-ensemble] averaged ({'+'.join(backbones)}): "
+          f"acc={result.accuracy:.4f} thr={ens.threshold:.3f}")
+    return ens, result

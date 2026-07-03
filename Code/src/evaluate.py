@@ -114,3 +114,23 @@ def best_threshold(y_true: np.ndarray, scores: np.ndarray) -> float:
         if acc > best_acc:
             best_acc, best_t = acc, float(t)
     return best_t
+
+
+def calibrate_ensemble(y_true: np.ndarray, scores_a: np.ndarray,
+                       scores_b: np.ndarray) -> tuple[float, float, float]:
+    """Blend two per-image score vectors: score = w*a + (1-w)*b.
+
+    Grid-searches the blend weight ``w`` and the decision threshold on the
+    validation labels; returns ``(w, threshold, accuracy)``.  With ``w`` = 1 the
+    ensemble degenerates to model A, so the result is never worse than the
+    better single model *on the validation split* (use with the usual
+    small-split caveat).
+    """
+    best = (1.0, 0.5, -1.0)
+    for w in np.linspace(0.0, 1.0, 21):
+        blend = w * scores_a + (1.0 - w) * scores_b
+        t = best_threshold(y_true, blend)
+        acc = float(((blend >= t).astype(int) == y_true).mean())
+        if acc > best[2]:
+            best = (float(w), float(t), acc)
+    return best
